@@ -1,0 +1,32 @@
+#!/bin/bash
+# bt-audio - helper for the Bluetooth TV -> Volumio DAC setup
+RUN=/run/bluetooth-audio
+ALSA_CARD=$( . /etc/default/bluetooth-audio 2>/dev/null; echo "${ALSA_CARD:-sndrpihifiberry}")
+case "$1" in
+  status)
+    echo "== services";  systemctl is-active bluetooth bluealsa bluetooth-audio-switch bluetooth-audio-aplay mpd | paste - - - - - | awk '{print "bluetooth="$1" bluealsa="$2" switch="$3" aplay="$4" mpd="$5}'
+    echo "== switch state"; cat $RUN/state.json 2>/dev/null; echo
+    echo "== DAC ($(grep -o 'owner_pid.*' /proc/asound/$ALSA_CARD/pcm0p/sub0/status 2>/dev/null || echo closed))"
+    grep -E 'format|rate' /proc/asound/$ALSA_CARD/pcm0p/sub0/hw_params 2>/dev/null
+    echo "== trusted/paired devices"
+    for m in $(bluetoothctl devices Paired 2>/dev/null | awk '$1=="Device"{print $2}'); do
+      bluetoothctl info $m | awk -v m=$m '/Name:/{n=substr($0,index($0,$2))} /Trusted:/{t=$2} /Connected:/{c=$2} END{print "  "m"  "n"  trusted="t"  connected="c}'
+    done
+    if [ -f $RUN/pairing-until ] && [ "$(date +%s)" -lt "$(cut -d. -f1 $RUN/pairing-until)" ]; then echo "== pairing window OPEN until $(date -d @$(cut -d. -f1 $RUN/pairing-until) +%T)"; fi ;;
+  pair)
+    sec=${2:-120}; sudo mkdir -p $RUN; echo $(( $(date +%s) + sec )) | sudo tee $RUN/pairing-until >/dev/null
+    sudo bluetoothctl discoverable on >/dev/null; sudo bluetoothctl pairable on >/dev/null
+    echo "Pairing window open for ${sec}s. On the TV choose Bluetooth audio device \"$(bluetoothctl show | awk -F': ' '/Alias/{print $2}')\"." ;;
+  unpair-window|close) sudo rm -f $RUN/pairing-until; echo "pairing window closed" ;;
+  connect)    [ -n "$2" ] || { echo "usage: bt-audio connect MAC"; exit 1; }; sudo bluetoothctl connect "$2" ;;
+  disconnect) if [ -n "$2" ]; then sudo bluetoothctl disconnect "$2"; else curl -s -X POST "http://127.0.0.1:8090/api/release?source=cli"; echo; fi ;;
+  take)       curl -s -X POST http://127.0.0.1:8090/api/take; echo ;;
+  api)        curl -s http://127.0.0.1:8090/api/state; echo ;;
+  forget)     [ -n "$2" ] || { echo "usage: bt-audio forget MAC"; exit 1; }; sudo bluetoothctl remove "$2" ;;
+  restart)    sudo systemctl restart bluealsa bluetooth-audio-switch ;;
+  logs)       journalctl -t bt-audio-switch -t bt-audio-aplay -t bluealsa -u bluetooth ${2:+--since "$2"} -n ${3:-80} --no-pager ;;
+  follow)     journalctl -t bt-audio-switch -t bt-audio-aplay -t bluealsa -f ;;
+  *) echo "usage: bt-audio {status|api|pair [sec]|close|connect MAC|disconnect [MAC]|take|forget MAC|restart|logs [since] [n]|follow}"
+     echo "  disconnect (no MAC) = end TV audio: DAC back to Volumio, TV disconnected"
+     echo "  take                = allow a released TV to take the DAC again"; exit 1 ;;
+esac

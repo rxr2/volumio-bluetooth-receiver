@@ -1,0 +1,25 @@
+# /etc/default/bluetooth-audio - settings for bluetooth-audio-switch / bluetooth-audio-aplay
+# After a change: sudo systemctl restart bluetooth-audio-switch
+
+# ALSA card id of Volumio's output DAC (see /proc/asound/cards) - filled in by install.sh
+ALSA_CARD=@ALSA_CARD@
+# ALSA PCM used by bluealsa-aplay (defined in /etc/alsa/conf.d/60-bluetooth-audio-output.conf)
+ALSA_PCM=bt_dac
+# bluealsa-aplay ALSA buffer / period in microseconds (latency vs. dropout safety)
+APLAY_BUFFER_US=200000
+APLAY_PERIOD_US=50000
+# give the DAC back to Volumio when the Bluetooth stream is idle this long (device still connected)
+IDLE_RELEASE_SEC=20
+# ...or this long after the device disconnected
+DISCONNECT_RELEASE_SEC=2
+# after "end session" the device is ignored until its stream was silent/disconnected this long
+SUPPRESS_SEC=60
+# 1 = resume Volumio playback after Bluetooth audio ends, if it was playing before
+RESUME_AFTER_BT=0
+# 1 = try once to connect trusted device(s) when the service starts (boot)
+RECONNECT_ON_START=1
+# codec chosen after a new connection (first one both sides support)
+CODEC_PREFERENCE=aptX-HD,aptX,SBC
+# local control API for the Volumio plugin (no authentication -> keep it on localhost)
+HTTP_BIND=127.0.0.1
+HTTP_PORT=8090

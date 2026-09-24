@@ -1,0 +1,29 @@
+{
+  "name": "tv_bluetooth",
+  "version": "1.0.0",
+  "description": "Bluetooth receiver for Volumio: shows the phone/TV Bluetooth source (title, cover art, signal, codec) in Now Playing and lets you end the session from the touch screen. Needs bluetooth-audio-switch.service from volumio-bluetooth-receiver.",
+  "main": "index.js",
+  "author": "rxr2",
+  "license": "MIT",
+  "volumio_info": {
+    "prettyName": "Bluetooth Receiver",
+    "icon": "fa-bluetooth",
+    "plugin_type": "music_service",
+    "boot_priority": 10,
+    "is_my_music_plugin": false,
+    "has_configuration": false,
+    "architectures": [
+      "armhf",
+      "arm64"
+    ],
+    "os": [
+      "bookworm"
+    ]
+  },
+  "engines": {
+    "node": ">=20",
+    "volumio": ">=4"
+  },
+  "dependencies": {},
+  "repository": "https://github.com/rxr2/volumio-bluetooth-receiver"
+}

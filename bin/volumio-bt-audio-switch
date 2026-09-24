@@ -1,0 +1,842 @@
+#!/usr/bin/env python3
+"""
+volumio-bt-audio-switch - phone / TV (A2DP source) -> Raspberry Pi (A2DP sink) -> I2S DAC,
+coexisting with Volumio/MPD on the same ALSA device.
+
+Event driven (D-Bus signals from BlueZ), no polling loop:
+
+  * BlueZ MediaTransport1 of an A2DP *sink* endpoint goes State=active (real audio stream)
+        -> ask Volumio to stop playback (REST API)
+        -> wait until the DAC PCM is really closed (/proc/asound/<card>/pcm0p/sub0/status)
+        -> start bluetooth-audio-aplay.service (bluealsa-aplay -> ALSA PCM bt_q7)
+  * transport disappears (TV disconnected) or stays idle for IDLE_RELEASE_SEC
+        -> stop bluetooth-audio-aplay.service
+        -> wait until the DAC PCM is closed
+        -> Volumio/MPD may use the DAC again (optionally resume playback)
+
+MPD itself is never stopped: Volumio does not reconnect to MPD after a longer
+MPD outage (tested), and a stopped MPD does not hold the ALSA device anyway.
+
+It also acts as the BlueZ pairing agent: only already trusted devices are
+accepted, new devices only while a pairing window is open (bt-audio pair).
+"""
+
+import asyncio
+import json
+import logging
+import os
+import signal
+import sys
+import time
+import urllib.request
+
+from dbus_fast import BusType, DBusError, Message, MessageType, Variant
+from dbus_fast.aio import MessageBus
+from dbus_fast.service import ServiceInterface, method
+
+# ---------------------------------------------------------------- config ----
+
+def _env(name, default):
+    return os.environ.get(name, default)
+
+ALSA_CARD = _env("ALSA_CARD", "sndrpihifiberry")
+APLAY_UNIT = _env("APLAY_UNIT", "bluetooth-audio-aplay.service")
+IDLE_RELEASE_SEC = float(_env("IDLE_RELEASE_SEC", "20"))
+DISCONNECT_RELEASE_SEC = float(_env("DISCONNECT_RELEASE_SEC", "2"))
+RELEASE_TIMEOUT_SEC = float(_env("RELEASE_TIMEOUT_SEC", "6"))
+RESUME_AFTER_BT = _env("RESUME_AFTER_BT", "0") == "1"
+RECONNECT_ON_START = _env("RECONNECT_ON_START", "1") == "1"
+VOLUMIO_API = _env("VOLUMIO_API", "http://127.0.0.1:3000/api/v1")
+SUPPRESS_SEC = float(_env("SUPPRESS_SEC", "60"))
+# after a new connection switch to the best codec both sides support (a connection initiated
+# by the Pi - e.g. reconnect after boot - otherwise often ends up with SBC)
+CODEC_PREFERENCE = [c.strip() for c in _env("CODEC_PREFERENCE", "aptX-HD,aptX,SBC").split(",") if c.strip()]
+# localhost only by default: the API has no authentication (Volumio plugin / kiosk run locally)
+HTTP_BIND = _env("HTTP_BIND", "127.0.0.1")
+HTTP_PORT = int(_env("HTTP_PORT", "8090"))
+RUN_DIR = _env("RUN_DIR", "/run/bluetooth-audio")
+PAIRING_FILE = os.path.join(RUN_DIR, "pairing-until")
+STATE_FILE = os.path.join(RUN_DIR, "state.json")
+
+PCM_STATUS = f"/proc/asound/{ALSA_CARD}/pcm0p/sub0/status"
+
+A2DP_SINK_UUID = "0000110b-0000-1000-8000-00805f9b34fb"
+A2DP_SOURCE_UUID = "0000110a-0000-1000-8000-00805f9b34fb"
+AUDIO_UUIDS = {
+    "0000110a-0000-1000-8000-00805f9b34fb",  # Audio Source
+    "0000110b-0000-1000-8000-00805f9b34fb",  # Audio Sink
+    "0000110c-0000-1000-8000-00805f9b34fb",  # AVRCP Target
+    "0000110d-0000-1000-8000-00805f9b34fb",  # A2DP
+    "0000110e-0000-1000-8000-00805f9b34fb",  # AVRCP Controller
+    "0000110f-0000-1000-8000-00805f9b34fb",  # AVRCP
+}
+AGENT_PATH = "/local/bluetooth_audio_agent"
+
+log = logging.getLogger("bt-audio-switch")
+
+# --------------------------------------------------------------- helpers ----
+
+def pairing_open():
+    try:
+        with open(PAIRING_FILE) as f:
+            return time.time() < float(f.read().strip() or 0)
+    except (OSError, ValueError):
+        return False
+
+
+def pcm_closed():
+    try:
+        with open(PCM_STATUS) as f:
+            return f.readline().strip() == "closed"
+    except OSError:
+        return True  # card gone -> nothing holds it
+
+
+async def wait_pcm_closed(timeout):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if pcm_closed():
+            return True
+        await asyncio.sleep(0.2)
+    return pcm_closed()
+
+
+async def run(*cmd, timeout=30):
+    proc = await asyncio.create_subprocess_exec(
+        *cmd, stdin=asyncio.subprocess.DEVNULL, stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT)
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        return -1, f"timeout after {timeout} s: {' '.join(cmd)}"
+    return proc.returncode, out.decode(errors="replace").strip()
+
+
+def _last_int(text):
+    try:
+        return int(text.strip().split()[-1])
+    except (ValueError, IndexError):
+        return None
+
+
+def _http_get(url):
+    with urllib.request.urlopen(url, timeout=5) as r:
+        return r.read().decode()
+
+
+async def volumio(cmd_path):
+    try:
+        return await asyncio.to_thread(_http_get, f"{VOLUMIO_API}/{cmd_path}")
+    except Exception as e:  # Volumio may not be up yet (boot) - not fatal
+        log.warning("Volumio API %s failed: %s", cmd_path, e)
+        return None
+
+
+def sbc_rate(config_bytes):
+    try:
+        b = bytes(config_bytes)[0] & 0xF0
+        return {0x80: 16000, 0x40: 32000, 0x20: 44100, 0x10: 48000}.get(b)
+    except Exception:
+        return None
+
+
+def sbc_info(config_bytes):
+    """Decode the negotiated SBC configuration -> rate, mode, max bitpool, bitrate (kbit/s)."""
+    try:
+        c = bytes(config_bytes)
+        rate = {0x80: 16000, 0x40: 32000, 0x20: 44100, 0x10: 48000}[c[0] & 0xF0]
+        mode = {0x08: "Mono", 0x04: "Dual", 0x02: "Stereo", 0x01: "JointStereo"}[c[0] & 0x0F]
+        blocks = {0x80: 4, 0x40: 8, 0x20: 12, 0x10: 16}[c[1] & 0xF0]
+        subbands = {0x08: 4, 0x04: 8}[c[1] & 0x0C]
+        bitpool = c[3]
+        ch = 1 if mode == "Mono" else 2
+        if mode in ("Mono", "Dual"):
+            data = -(-(blocks * ch * bitpool) // 8)
+        else:
+            data = -(-((subbands if mode == "JointStereo" else 0) + blocks * bitpool) // 8)
+        frame = 4 + (4 * subbands * ch) // 8 + data
+        return {"rate": rate, "mode": mode, "bitpool": bitpool,
+                "kbps": round(8 * frame * rate / (subbands * blocks) / 1000)}
+    except Exception:
+        return {}
+
+
+def codec_kbps(codec, rate, sbc=None):
+    if codec == "SBC" and sbc:
+        return sbc.get("kbps")
+    if codec == "aptX" and rate:
+        return round(rate * 16 * 2 / 4 / 1000)     # 4:1 ADPCM, 16 bit
+    if codec == "aptX-HD" and rate:
+        return round(rate * 24 * 2 / 4 / 1000)     # 4:1 ADPCM, 24 bit
+    return None
+
+
+CODECS = {0: "SBC", 1: "MP3", 2: "AAC", 4: "ATRAC", 0xFF: "vendor(aptX/aptX-HD/LDAC/...)"}
+
+# ----------------------------------------------------------------- agent ----
+
+class Agent(ServiceInterface):
+    """BlueZ Agent1: trusted devices only, new ones only in the pairing window."""
+
+    def __init__(self, sw):
+        super().__init__("org.bluez.Agent1")
+        self.sw = sw
+
+    def _check_pairing(self, device, what):
+        if pairing_open():
+            log.info("%s accepted for %s (pairing window open)", what, self.sw.dev_label(device))
+            self.sw.pending_trust.add(device)
+            return
+        log.warning("%s REJECTED for %s (pairing window closed; run: bt-audio pair)",
+                    what, self.sw.dev_label(device))
+        raise DBusError("org.bluez.Error.Rejected", "pairing window closed")
+
+    @method()
+    def Release(self):
+        log.info("agent released by BlueZ")
+
+    @method()
+    def RequestPinCode(self, device: "o") -> "s":
+        self._check_pairing(device, "RequestPinCode")
+        return "0000"
+
+    @method()
+    def RequestPasskey(self, device: "o") -> "u":
+        self._check_pairing(device, "RequestPasskey")
+        return 0
+
+    @method()
+    def DisplayPasskey(self, device: "o", passkey: "u", entered: "q"):
+        pass
+
+    @method()
+    def DisplayPinCode(self, device: "o", pincode: "s"):
+        pass
+
+    @method()
+    def RequestConfirmation(self, device: "o", passkey: "u"):
+        self._check_pairing(device, f"RequestConfirmation({passkey:06d})")
+
+    @method()
+    def RequestAuthorization(self, device: "o"):
+        self._check_pairing(device, "RequestAuthorization")
+
+    @method()
+    def AuthorizeService(self, device: "o", uuid: "s"):
+        uuid = uuid.lower()
+        trusted = self.sw.devices.get(device, {}).get("Trusted", False)
+        if uuid in AUDIO_UUIDS and (trusted or pairing_open()):
+            log.info("AuthorizeService %s for %s", uuid[:8], self.sw.dev_label(device))
+            return
+        log.warning("AuthorizeService %s REJECTED for %s", uuid[:8], self.sw.dev_label(device))
+        raise DBusError("org.bluez.Error.Rejected", "not allowed")
+
+    @method()
+    def Cancel(self):
+        log.info("pairing cancelled")
+
+# ---------------------------------------------------------------- switch ----
+
+class Switch:
+    def __init__(self, bus):
+        self.bus = bus
+        self.transports = {}   # path -> props (A2DP sink transports only)
+        self.devices = {}      # path -> Device1 props
+        self.adapters = {}     # path -> Adapter1 props
+        self.players = {}      # path -> MediaPlayer1 props (AVRCP metadata from phones)
+        self.rssi = None
+        self.rssi_task = None
+        self.ba_pcm = {}       # BlueALSA PCM of the streaming device: Codec, Sampling, Format, Delay
+        self.codec_checked = set()   # devices whose codec was already optimised on this connection
+        self.pending_trust = set()
+        self.mode = "mpd"
+        self.bt_device = None
+        self.resume_volumio = False
+        self.lock = asyncio.Lock()
+        self.release_task = None
+        self.retry_task = None
+        # manual "end TV audio": device path -> monotonic time of its last active stream;
+        # it cannot take the DAC again until it has been silent/disconnected SUPPRESS_SEC
+        self.suppressed = {}
+        self.info = {}
+        self.listeners = set()   # asyncio.Queue per /api/events client
+
+    # ---- bookkeeping ------------------------------------------------------
+    def dev_label(self, path):
+        d = self.devices.get(path, {})
+        return f"{d.get('Name', d.get('Alias', '?'))} [{d.get('Address', path)}]"
+
+    def _update(self, path, iface, props):
+        if iface == "org.bluez.MediaTransport1":
+            t = self.transports.get(path, {})
+            t.update(props)
+            if t.get("UUID", "").lower() == A2DP_SINK_UUID:
+                self.transports[path] = t
+        elif iface == "org.bluez.Device1":
+            self.devices.setdefault(path, {}).update(props)
+        elif iface == "org.bluez.Adapter1":
+            self.adapters.setdefault(path, {}).update(props)
+        elif iface == "org.bluez.MediaPlayer1":
+            self.players.setdefault(path, {}).update(props)
+
+    def player_of(self, dev):
+        for p, pl in self.players.items():
+            if pl.get("Device") == dev or (dev and p.startswith(dev + "/")):
+                return p, pl
+        return None, {}
+
+    @staticmethod
+    def _plain(props):
+        return {k: (v.value if isinstance(v, Variant) else v) for k, v in props.items()}
+
+    def write_state(self, extra=None):
+        self.info = {"since": time.strftime("%Y-%m-%d %H:%M:%S")}
+        self.info.update(extra or {})
+        self.publish()
+
+    def snapshot(self):
+        d = self.devices.get(self.bt_device, {}) if self.bt_device else {}
+        try:
+            until = float(open(PAIRING_FILE).read().strip() or 0)
+        except (OSError, ValueError):
+            until = 0
+        hw = {}
+        if not pcm_closed():
+            try:
+                with open(f"/proc/asound/{ALSA_CARD}/pcm0p/sub0/hw_params") as f:
+                    hw = dict(l.split(": ", 1) for l in f.read().splitlines() if ": " in l)
+            except OSError:
+                pass
+        dev = self.bt_device
+        _, pl = self.player_of(dev) if dev else (None, {})
+        track = pl.get("Track") or {}
+        track = {k: (v.value if isinstance(v, Variant) else v) for k, v in track.items()}
+        player = None
+        if pl:
+            player = {"status": pl.get("Status"), "position": pl.get("Position"),
+                      "title": track.get("Title"), "artist": track.get("Artist"),
+                      "album": track.get("Album"), "duration": track.get("Duration")}
+        icon = d.get("Icon", "")
+        kind = "phone" if icon.startswith("phone") else ("computer" if icon.startswith("computer") else "tv")
+        tp = next((t for t in self.transports.values() if t.get("Device") == dev), {}) if dev else {}
+        sbc = sbc_info(tp.get("Configuration", b"")) if tp.get("Codec") == 0 else {}
+        return {
+            "mode": self.mode,
+            "since": self.info.get("since"),
+            "device": {"name": d.get("Name", d.get("Alias")), "address": d.get("Address"),
+                       "icon": icon, "kind": kind} if d else None,
+            "rssi": self.rssi if dev else None,
+            "codec": self.ba_pcm.get("Codec") or self.info.get("codec"),
+            "bits": (self.ba_pcm.get("Format", 0) & 0xFF) or None,
+            "bt_delay_ms": round(self.ba_pcm.get("Delay", 0) / 10) if self.ba_pcm.get("Delay") else None,
+            "kbps": codec_kbps(self.ba_pcm.get("Codec") or self.info.get("codec"),
+                               self.ba_pcm.get("Sampling") or self.info.get("bt_rate"), sbc),
+            "sbc": sbc or None,
+            "player": player,
+            "bt_rate": self.ba_pcm.get("Sampling") or self.info.get("bt_rate"),
+            "dac": {"format": hw.get("format"), "rate": hw.get("rate", "").split(" ")[0] or None} if hw else None,
+            "tv_connected_idle": bool(self.transports) and not self.active_transports(),
+            "suppressed": [self.dev_label(p) for p in self.suppressed],
+            "adapter_name": next(iter(self.adapters.values()), {}).get("Alias"),
+            "pairing_open": time.time() < until,
+            "pairing_until": int(until) if time.time() < until else None,
+            "devices": [{"name": v.get("Name", v.get("Alias")), "address": v.get("Address"),
+                         "trusted": bool(v.get("Trusted")), "connected": bool(v.get("Connected"))}
+                        for v in self.devices.values() if v.get("Paired")],
+        }
+
+    def publish(self):
+        snap = self.snapshot()
+        try:
+            with open(STATE_FILE + ".tmp", "w") as f:
+                json.dump(snap, f, indent=1)
+            os.replace(STATE_FILE + ".tmp", STATE_FILE)
+        except OSError as e:
+            log.warning("cannot write state: %s", e)
+        for q in list(self.listeners):
+            if q.qsize() < 20:
+                q.put_nowait(snap)
+
+    # ---- D-Bus plumbing -----------------------------------------------------
+    async def call(self, dest, path, iface, member, sig="", body=None):
+        reply = await self.bus.call(Message(destination=dest, path=path, interface=iface,
+                                            member=member, signature=sig, body=body or []))
+        if reply.message_type == MessageType.ERROR:
+            raise DBusError(reply.error_name, str(reply.body[0] if reply.body else ""))
+        return reply.body
+
+    async def setup(self):
+        for rule in (
+            "type='signal',sender='org.bluez',interface='org.freedesktop.DBus.Properties',"
+            "member='PropertiesChanged',path_namespace='/org/bluez'",
+            "type='signal',sender='org.bluez',interface='org.freedesktop.DBus.ObjectManager'",
+            "type='signal',sender='org.freedesktop.DBus',member='NameOwnerChanged',arg0='org.bluez'",
+        ):
+            await self.call("org.freedesktop.DBus", "/org/freedesktop/DBus",
+                            "org.freedesktop.DBus", "AddMatch", "s", [rule])
+        self.bus.add_message_handler(self.on_message)
+
+        (objs,) = await self.call("org.bluez", "/", "org.freedesktop.DBus.ObjectManager",
+                                  "GetManagedObjects")
+        for path, ifaces in objs.items():
+            for iface, props in ifaces.items():
+                self._update(path, iface, self._plain(props))
+
+        self.bus.export(AGENT_PATH, Agent(self))
+        await self.call("org.bluez", "/org/bluez", "org.bluez.AgentManager1",
+                        "RegisterAgent", "os", [AGENT_PATH, "NoInputNoOutput"])
+        await self.call("org.bluez", "/org/bluez", "org.bluez.AgentManager1",
+                        "RequestDefaultAgent", "o", [AGENT_PATH])
+        log.info("pairing agent registered (NoInputNoOutput, trusted devices only)")
+
+        trusted = [p for p, d in self.devices.items() if d.get("Trusted")]
+        for p in trusted:
+            log.info("trusted device: %s connected=%s", self.dev_label(p),
+                     self.devices[p].get("Connected"))
+
+        # leftover from a previous crash: nothing streams -> make sure the DAC is free
+        rc, out = await run("systemctl", "is-active", APLAY_UNIT)
+        if out == "active" and not self.active_transports():
+            log.info("stale %s found at start - stopping it", APLAY_UNIT)
+            await run("systemctl", "stop", APLAY_UNIT)
+        elif out == "active":
+            self.mode = "bt"
+
+        self.write_state()
+        await self.reconcile()
+
+        if RECONNECT_ON_START:
+            for p in trusted:
+                d = self.devices[p]
+                if not d.get("Connected") and A2DP_SOURCE_UUID in [u.lower() for u in d.get("UUIDs", [])]:
+                    asyncio.create_task(self.try_connect(p))
+
+    async def try_connect(self, path):
+        for _ in range(20):   # right after a bluetoothd (re)start the adapter is still powering up
+            if any(a.get("Powered") for a in self.adapters.values()):
+                break
+            await asyncio.sleep(1)
+        try:
+            await asyncio.wait_for(self.call("org.bluez", path, "org.bluez.Device1", "Connect"), 30)
+            log.info("reconnected to %s", self.dev_label(path))
+        except Exception as e:
+            log.info("reconnect to %s not possible now (%s) - waiting for the TV to connect",
+                     self.dev_label(path), getattr(e, "text", e))
+
+    def on_message(self, msg):
+        if msg.message_type != MessageType.SIGNAL:
+            return
+        m = msg.member
+        if m == "NameOwnerChanged" and msg.body[0] == "org.bluez" and not msg.body[2]:
+            log.error("bluetoothd disappeared - exiting so systemd restarts us cleanly")
+            asyncio.get_running_loop().call_soon(os.kill, os.getpid(), signal.SIGTERM)
+            return
+        if m == "PropertiesChanged":
+            iface, changed = msg.body[0], self._plain(msg.body[1])
+            if iface == "org.bluez.MediaPlayer1":
+                self._update(msg.path, iface, changed)
+                if self.mode == "bt":
+                    self.publish()
+                return
+            if iface not in ("org.bluez.MediaTransport1", "org.bluez.Device1"):
+                return
+            self._update(msg.path, iface, changed)
+            if iface == "org.bluez.Device1":
+                if "Connected" in changed:
+                    log.info("device %s %s", self.dev_label(msg.path),
+                             "connected" if changed["Connected"] else "disconnected")
+                    if not changed["Connected"]:
+                        self.codec_checked.discard(msg.path)
+                if changed.get("Paired") and msg.path in self.pending_trust:
+                    asyncio.create_task(self.trust(msg.path))
+                self.publish()
+                return
+            if msg.path in self.transports and "State" in changed:
+                log.info("A2DP transport %s -> %s", self.dev_label(self.transports[msg.path].get("Device")),
+                         changed["State"])
+            asyncio.create_task(self.reconcile())
+        elif m == "InterfacesAdded":
+            path, ifaces = msg.body
+            for iface, props in ifaces.items():
+                self._update(path, iface, self._plain(props))
+            if path in self.transports:
+                dev = self.transports[path].get("Device")
+                log.info("A2DP sink transport added for %s (state %s)",
+                         self.dev_label(dev), self.transports[path].get("State"))
+                if dev and dev not in self.codec_checked:
+                    self.codec_checked.add(dev)
+                    asyncio.create_task(self.ensure_best_codec(dev))
+                asyncio.create_task(self.reconcile())
+        elif m == "InterfacesRemoved":
+            path, ifaces = msg.body
+            if "org.bluez.MediaTransport1" in ifaces and path in self.transports:
+                log.info("A2DP sink transport removed (%s)", self.dev_label(self.transports[path].get("Device")))
+                del self.transports[path]
+                asyncio.create_task(self.reconcile())
+            if "org.bluez.Device1" in ifaces:
+                self.devices.pop(path, None)
+            if "org.bluez.MediaPlayer1" in ifaces:
+                self.players.pop(path, None)
+
+    async def trust(self, path):
+        self.pending_trust.discard(path)
+        try:
+            await self.call("org.bluez", path, "org.freedesktop.DBus.Properties", "Set", "ssv",
+                            ["org.bluez.Device1", "Trusted", Variant("b", True)])
+            self.devices.setdefault(path, {})["Trusted"] = True
+            log.info("paired and TRUSTED: %s", self.dev_label(path))
+            self.publish()
+        except DBusError as e:
+            log.error("cannot trust %s: %s", self.dev_label(path), e)
+
+    # ---- state machine ----------------------------------------------------
+    def active_transports(self):
+        return [p for p, t in self.transports.items() if t.get("State") == "active"]
+
+    def _eligible(self, active):
+        """Drop streams of devices the user sent away with 'end TV audio'."""
+        now = time.monotonic()
+        active_devs = {self.transports[p].get("Device") for p in active}
+        out = []
+        for dev, rec in list(self.suppressed.items()):
+            if dev not in active_devs and rec["active"]:
+                rec["active"], rec["last"] = False, now       # stream stopped: start the quiet timer
+            elif dev in active_devs and not rec["active"]:
+                if now - rec["last"] > SUPPRESS_SEC:
+                    log.info("%s was quiet %.0f s - allowed to take the DAC again",
+                             self.dev_label(dev), now - rec["last"])
+                    del self.suppressed[dev]
+                else:
+                    rec["active"] = True
+        for p in active:
+            if self.transports[p].get("Device") not in self.suppressed:
+                out.append(p)
+        return out
+
+    async def reconcile(self):
+        async with self.lock:
+            active = self._eligible(self.active_transports())
+            self.publish()
+            if active:
+                self._cancel("release_task")
+                if self.mode == "mpd":
+                    await self.enter_bt(active[0])
+            elif self.mode == "bt" and not self.release_task:
+                delay = IDLE_RELEASE_SEC if self.transports else DISCONNECT_RELEASE_SEC
+                log.info("no active A2DP stream - returning DAC to Volumio in %.0f s", delay)
+                self.release_task = asyncio.create_task(self._release_later(delay))
+
+    def _cancel(self, name):
+        t = getattr(self, name)
+        if t and t is not asyncio.current_task():
+            t.cancel()
+        setattr(self, name, None)
+
+    async def _release_later(self, delay):
+        try:
+            await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            return
+        async with self.lock:
+            self.release_task = None
+            if self.mode == "bt" and not self._eligible(self.active_transports()):
+                await self.leave_bt()
+
+    async def _retry_later(self):
+        await asyncio.sleep(5)
+        self.retry_task = None
+        await self.reconcile()
+
+    async def enter_bt(self, tpath):
+        t = self.transports[tpath]
+        dev = t.get("Device")
+        cfg = t.get("Configuration", b"")
+        codec = CODECS.get(t.get("Codec"), str(t.get("Codec")))
+        rate = sbc_rate(cfg) if t.get("Codec") == 0 else None
+        log.info(">>> Bluetooth audio active: %s codec=%s rate=%s -> taking the DAC from Volumio",
+                 self.dev_label(dev), codec, rate)
+
+        st = await volumio("getState")
+        try:
+            self.resume_volumio = json.loads(st).get("status") == "play" if st else False
+        except ValueError:
+            self.resume_volumio = False
+        await volumio("commands/?cmd=stop")
+        if not await wait_pcm_closed(RELEASE_TIMEOUT_SEC):
+            log.warning("DAC still open after Volumio stop - trying 'mpc stop'")
+            await run("mpc", "-q", "stop")
+            if not await wait_pcm_closed(3):
+                log.error("DAC is still held by another program - will retry in 5 s")
+                if not self.retry_task:
+                    self.retry_task = asyncio.create_task(self._retry_later())
+                return
+        rc, out = await run("systemctl", "start", APLAY_UNIT)
+        if rc != 0:
+            log.error("cannot start %s: %s", APLAY_UNIT, out)
+            return
+        self.mode, self.bt_device = "bt", dev
+        self.write_state({"codec": codec, "bt_rate": rate})
+        asyncio.create_task(self.log_bluealsa_pcm())
+        self._cancel("rssi_task")
+        self.rssi_task = asyncio.create_task(self._rssi_loop())
+        log.info("bluealsa-aplay started - Bluetooth source plays through the DAC")
+
+    async def leave_bt(self):
+        log.info("<<< Bluetooth audio gone - releasing the DAC")
+        self._cancel("rssi_task")
+        self.rssi = None
+        self.ba_pcm = {}
+        await run("systemctl", "stop", APLAY_UNIT)
+        if not await wait_pcm_closed(RELEASE_TIMEOUT_SEC):
+            log.error("DAC not released after stopping %s", APLAY_UNIT)
+        self.mode, self.bt_device = "mpd", None
+        self.write_state()
+        if RESUME_AFTER_BT and self.resume_volumio:
+            log.info("resuming Volumio playback")
+            await volumio("commands/?cmd=play")
+        log.info("DAC is back with Volumio/MPD")
+
+    async def ensure_best_codec(self, dev):
+        await asyncio.sleep(1.5)   # let BlueALSA finish setting up the PCM
+        path = dev.replace("/org/bluez", "/org/bluealsa", 1) + "/a2dpsnk/source"
+        try:
+            (codecs,) = await self.call("org.bluealsa", path, "org.bluealsa.PCM1", "GetCodecs")
+            (cur,) = await self.call("org.bluealsa", path, "org.freedesktop.DBus.Properties", "Get",
+                                     "ss", ["org.bluealsa.PCM1", "Codec"])
+            cur = cur.value if isinstance(cur, Variant) else cur
+            best = next((c for c in CODEC_PREFERENCE if c in codecs), None)
+            rank = {c: i for i, c in enumerate(CODEC_PREFERENCE)}
+            if best and best != cur and rank[best] < rank.get(cur, len(rank)):
+                log.info("codec %s -> %s for %s (available: %s)", cur, best, self.dev_label(dev),
+                         ", ".join(codecs))
+                await self.call("org.bluealsa", path, "org.bluealsa.PCM1", "SelectCodec", "sa{sv}", [best, {}])
+            else:
+                log.info("codec %s kept for %s (available: %s)", cur, self.dev_label(dev), ", ".join(codecs))
+        except Exception as e:
+            log.info("codec selection skipped for %s: %s", self.dev_label(dev), e)
+
+    async def read_bluealsa_pcm(self):
+        if not self.bt_device:
+            return
+        path = self.bt_device.replace("/org/bluez", "/org/bluealsa", 1) + "/a2dpsnk/source"
+        try:
+            (props,) = await self.call("org.bluealsa", path, "org.freedesktop.DBus.Properties",
+                                       "GetAll", "s", ["org.bluealsa.PCM1"])
+            pcm = self._plain(props)
+            pcm = {k: pcm.get(k) for k in ("Codec", "Sampling", "Format", "Delay", "Channels")}
+        except Exception:
+            pcm = {}
+        if pcm != self.ba_pcm:
+            self.ba_pcm = pcm
+            self.publish()
+
+    async def _rssi_loop(self):
+        """Link quality of the streaming source every 5 s (only while it streams to the DAC).
+
+        BR/EDR HCI_Read_RSSI is relative to the controller's golden receive power range:
+        0 = inside the optimal range, negative = dB below it. Link quality is 0..255."""
+        warned = False
+        while self.mode == "bt" and self.bt_device:
+            addr = self.devices.get(self.bt_device, {}).get("Address")
+            rc1, o1 = await run("hcitool", "rssi", addr, timeout=4)
+            rc2, o2 = await run("hcitool", "lq", addr, timeout=4)
+            sig = {"rssi": _last_int(o1) if rc1 == 0 else None, "lq": _last_int(o2) if rc2 == 0 else None}
+            if sig["rssi"] is None and not warned:
+                warned = True
+                log.info("RSSI unavailable: %s", o1[:120])
+            if sig != self.rssi:
+                self.rssi = sig
+                self.publish()
+            await self.read_bluealsa_pcm()
+            await asyncio.sleep(5)
+
+    async def log_bluealsa_pcm(self):
+        await asyncio.sleep(2)
+        await self.read_bluealsa_pcm()
+        snap = self.snapshot()
+        sbc = snap.get("sbc")
+        log.info("codec %s %s Hz %s bit, %s kbit/s%s, BT delay %s ms", snap.get("codec"), snap.get("bt_rate"),
+                 snap.get("bits"), snap.get("kbps"),
+                 f" (SBC {sbc['mode']} bitpool {sbc['bitpool']})" if sbc else "", snap.get("bt_delay_ms"))
+        try:
+            with open(f"/proc/asound/{ALSA_CARD}/pcm0p/sub0/hw_params") as f:
+                hw = dict(l.split(": ", 1) for l in f.read().splitlines() if ": " in l)
+            log.info("DAC hw_params: format=%s rate=%s period=%s buffer=%s", hw.get("format"),
+                     hw.get("rate"), hw.get("period_size"), hw.get("buffer_size"))
+        except OSError:
+            pass
+
+    # ---- manual control (HTTP API / Volumio plugin) ---------------------
+    async def release(self, source="api"):
+        """End TV audio now: give the DAC to Volumio and disconnect the TV."""
+        async with self.lock:
+            self._cancel("release_task")
+            now = time.monotonic()
+            devs = {self.transports[p].get("Device") for p in self.active_transports()}
+            if self.bt_device:
+                devs.add(self.bt_device)
+            for dev in devs:
+                self.suppressed[dev] = {"active": False, "last": now}
+            log.info("manual release requested (%s) - devices: %s", source,
+                     ", ".join(self.dev_label(d) for d in devs) or "none")
+            if self.mode == "bt":
+                await self.leave_bt()
+        for dev in devs:
+            try:
+                await asyncio.wait_for(self.call("org.bluez", dev, "org.bluez.Device1", "Disconnect"), 10)
+                log.info("disconnected %s", self.dev_label(dev))
+            except Exception as e:
+                log.warning("disconnect %s failed: %s", self.dev_label(dev), e)
+        self.publish()
+        return {"ok": True, "released": [self.dev_label(d) for d in devs]}
+
+    async def player_cmd(self, cmd):
+        if cmd not in ("Play", "Pause", "Next", "Previous", "Stop"):
+            return {"ok": False, "error": "bad command"}
+        path, _ = self.player_of(self.bt_device)
+        if not path:
+            return {"ok": False, "error": "no AVRCP player"}
+        try:
+            await self.call("org.bluez", path, "org.bluez.MediaPlayer1", cmd)
+            return {"ok": True}
+        except DBusError as e:
+            return {"ok": False, "error": str(e)}
+
+    async def take(self):
+        """Undo a manual release: the TV may take the DAC again right away."""
+        self.suppressed.clear()
+        await self.reconcile()
+        return {"ok": True, "mode": self.mode}
+
+    async def open_pairing(self, sec):
+        sec = max(10, min(int(sec), 900))
+        with open(PAIRING_FILE, "w") as f:
+            f.write(str(time.time() + sec))
+        try:
+            adapter = next(iter(self.adapters))
+            for prop in ("Discoverable", "Pairable"):
+                await self.call("org.bluez", adapter, "org.freedesktop.DBus.Properties", "Set", "ssv",
+                                ["org.bluez.Adapter1", prop, Variant("b", True)])
+        except Exception as e:
+            log.warning("cannot set adapter discoverable: %s", e)
+        log.info("pairing window open for %d s", sec)
+        asyncio.get_running_loop().call_later(sec + 1, self.publish)
+        self.publish()
+        return {"ok": True, "seconds": sec}
+
+    async def shutdown(self):
+        self._cancel("release_task")
+        try:
+            await self.call("org.bluez", "/org/bluez", "org.bluez.AgentManager1",
+                            "UnregisterAgent", "o", [AGENT_PATH])
+        except Exception:
+            pass
+        if self.mode == "bt":
+            await run("systemctl", "stop", APLAY_UNIT)
+
+
+# ------------------------------------------------------------------ http ----
+# Tiny dependency-free HTTP server: JSON API + server-sent events (used by the Volumio plugin).
+#   GET  /api/state        JSON snapshot
+#   GET  /api/events       text/event-stream, one JSON snapshot per change
+#   POST /api/release      end TV audio -> DAC back to Volumio, TV disconnected
+#   POST /api/player?cmd=play|pause|next|previous   AVRCP remote control (phones)
+#   POST /api/take         let the (released) TV take the DAC again
+#   POST /api/pair?sec=N   open the pairing window for N seconds
+
+class Http:
+    def __init__(self, sw):
+        self.sw = sw
+
+    async def start(self):
+        self.server = await asyncio.start_server(self.handle, HTTP_BIND, HTTP_PORT)
+        log.info("HTTP API on %s:%d", HTTP_BIND, HTTP_PORT)
+
+    async def handle(self, reader, writer):
+        try:
+            head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), 10)
+            line = head.split(b"\r\n", 1)[0].decode(errors="replace")
+            meth, target, _ = line.split(" ", 2)
+            path, _, query = target.partition("?")
+            params = dict(p.partition("=")[::2] for p in query.split("&") if p)
+            if meth == "GET" and path == "/api/events":
+                return await self.events(writer)
+            status, ctype, body = await self.route(meth, path, params)
+        except (asyncio.IncompleteReadError, asyncio.TimeoutError, ValueError, ConnectionError):
+            writer.close()
+            return
+        except Exception as e:
+            log.exception("http error")
+            status, ctype, body = "500 Internal Server Error", "application/json", json.dumps({"error": str(e)})
+        data = body.encode() if isinstance(body, str) else body
+        writer.write((f"HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {len(data)}\r\n"
+                      "Cache-Control: no-store\r\nAccess-Control-Allow-Origin: *\r\n"
+                      "Connection: close\r\n\r\n").encode() + data)
+        try:
+            await writer.drain()
+        finally:
+            writer.close()
+
+    async def route(self, meth, path, params):
+        js = "application/json"
+        if path == "/api/state" and meth == "GET":
+            return "200 OK", js, json.dumps(self.sw.snapshot())
+        if meth == "OPTIONS":
+            return "204 No Content", "text/plain", ""
+        if meth != "POST":
+            return "405 Method Not Allowed", js, '{"error":"use POST"}'
+        if path == "/api/release":
+            return "200 OK", js, json.dumps(await self.sw.release(params.get("source", "api")))
+        if path == "/api/player":
+            return "200 OK", js, json.dumps(await self.sw.player_cmd(params.get("cmd", "").capitalize()))
+        if path == "/api/take":
+            return "200 OK", js, json.dumps(await self.sw.take())
+        if path == "/api/pair":
+            return "200 OK", js, json.dumps(await self.sw.open_pairing(params.get("sec", "120")))
+        return "404 Not Found", js, '{"error":"not found"}'
+
+    async def events(self, writer):
+        q = asyncio.Queue()
+        self.sw.listeners.add(q)
+        try:
+            writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\n"
+                         b"Access-Control-Allow-Origin: *\r\nConnection: keep-alive\r\n\r\n")
+            q.put_nowait(self.sw.snapshot())
+            while True:
+                try:
+                    snap = await asyncio.wait_for(q.get(), 25)
+                    writer.write(f"data: {json.dumps(snap)}\n\n".encode())
+                except asyncio.TimeoutError:
+                    writer.write(b": ping\n\n")         # keeps proxies/browsers from timing out
+                await writer.drain()
+        except (ConnectionError, asyncio.CancelledError):
+            pass
+        finally:
+            self.sw.listeners.discard(q)
+            writer.close()
+
+
+async def main():
+    logging.basicConfig(level=logging.INFO, stream=sys.stdout, format="%(levelname)s %(message)s")
+    os.makedirs(RUN_DIR, exist_ok=True)
+    bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+    sw = Switch(bus)
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for s in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(s, stop.set)
+    await sw.setup()
+    if HTTP_PORT:
+        await Http(sw).start()
+    log.info("running (card=%s, idle release %.0f s)", ALSA_CARD, IDLE_RELEASE_SEC)
+    disc = asyncio.create_task(bus.wait_for_disconnect())
+    await asyncio.wait([asyncio.create_task(stop.wait()), disc], return_when=asyncio.FIRST_COMPLETED)
+    log.info("shutting down")
+    await sw.shutdown()
+    return 1 if disc.done() else 0
+
+
+if __name__ == "__main__":
+    sys.exit(asyncio.run(main()))

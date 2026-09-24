@@ -1,0 +1,21 @@
+[Unit]
+Description=Bluetooth audio (phone/TV A2DP sink) <-> Volumio DAC switch
+Documentation=https://github.com/rxr2/volumio-bluetooth-receiver
+Requires=bluetooth.service
+Wants=bluealsa.service
+After=bluetooth.service bluealsa.service volumio.service sound.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/default/bluetooth-audio
+ExecStart=/usr/local/bin/volumio-bt-audio-switch
+ExecStopPost=/bin/systemctl stop bluetooth-audio-aplay.service
+Restart=always
+RestartSec=3
+SyslogIdentifier=bt-audio-switch
+RuntimeDirectory=bluetooth-audio
+RuntimeDirectoryPreserve=yes
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

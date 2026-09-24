@@ -1,0 +1,18 @@
+[Unit]
+Description=Bluetooth audio player (bluealsa-aplay -> DAC), started by bluetooth-audio-switch
+Requires=bluealsa.service
+After=bluealsa.service
+PartOf=bluetooth-audio-switch.service
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/default/bluetooth-audio
+ExecStart=/usr/bin/bluealsa-aplay --pcm=${ALSA_PCM} --pcm-buffer-time=${APLAY_BUFFER_US} --pcm-period-time=${APLAY_PERIOD_US} --profile-a2dp --single-audio
+Restart=on-failure
+RestartSec=2
+User=volumio
+Group=audio
+SyslogIdentifier=bt-audio-aplay
+Nice=-5
+KillMode=control-group
+TimeoutStopSec=5
