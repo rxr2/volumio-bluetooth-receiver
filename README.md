@@ -94,6 +94,16 @@ A Volumio update or factory reset may wipe `/etc` and `/usr/local`. If that happ
 - **Codec choice depends on who connects.** When the phone connects, Android picks the best codec. When the Pi connects (e.g. after boot), BlueZ picks, often SBC. The switch then calls `org.bluealsa.PCM1.SelectCodec` to move to aptX HD.
 - **Bit depth to the DAC.** FIFO reclockers such as the FifoPi work at the format MPD uses (S32_LE, 64 fs BCLK). Sending S16 would change BCLK to 32 fs, which is why I2S cards get `format S32_LE`. That's lossless padding.
 
+## Room correction / DSP (FusionDsp)
+
+Works together with the [FusionDsp](https://github.com/balbuze/volumio-plugins-sources-bookworm) plugin (CamillaDSP). With FusionDsp enabled, Volumio's output goes `volumio → volumioDsp → FIFO → CamillaDSP → DAC`, and CamillaDSP keeps the DAC open all the time. To get the correction on Bluetooth as well, set this in `/etc/default/bluetooth-audio`:
+
+```
+ALSA_PCM=volumio
+```
+
+With that, the Bluetooth stream goes through Volumio's own chain: through the DSP when it's enabled, straight to the DAC when it isn't. The switch notices the DSP by itself. It then treats the output as free when nobody except CamillaDSP has the DSP FIFO open, instead of waiting for the DAC's ALSA device to close.
+
 ## Troubleshooting
 
 - **The TV doesn't list the Pi as a speaker.**

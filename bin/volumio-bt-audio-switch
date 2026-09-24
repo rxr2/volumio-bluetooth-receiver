@@ -84,7 +84,41 @@ def pairing_open():
         return False
 
 
+DSP_FIFO = _env("DSP_FIFO", "/tmp/fusiondspfifo")
+DSP_READERS = ("camilladsp",)
+
+
+def dsp_active():
+    """FusionDsp (CamillaDSP) sits in Volumio's output chain: it keeps the DAC open all
+    the time and the sources write into its FIFO instead."""
+    try:
+        return os.path.exists(DSP_FIFO) and "volumioDsp" in open("/etc/asound.conf").read()
+    except OSError:
+        return False
+
+
+def fifo_writers():
+    """PIDs (other than the DSP itself) that have the DSP FIFO open."""
+    pids = []
+    for pid in filter(str.isdigit, os.listdir("/proc")):
+        try:
+            with open(f"/proc/{pid}/comm") as f:
+                if f.read().strip() in DSP_READERS:
+                    continue
+            for fd in os.listdir(f"/proc/{pid}/fd"):
+                if os.readlink(f"/proc/{pid}/fd/{fd}") == DSP_FIFO:
+                    pids.append(int(pid))
+                    break
+        except OSError:
+            continue
+    return pids
+
+
 def pcm_closed():
+    """True when no *source* holds the output: with the DSP in the chain that means nobody
+    but CamillaDSP has its FIFO open, otherwise the DAC's ALSA PCM is closed."""
+    if dsp_active():
+        return not fifo_writers()
     try:
         with open(PCM_STATUS) as f:
             return f.readline().strip() == "closed"
