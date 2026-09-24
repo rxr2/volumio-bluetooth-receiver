@@ -230,7 +230,11 @@ class Agent(ServiceInterface):
         if uuid in AUDIO_UUIDS and (trusted or pairing_open()):
             log.info("AuthorizeService %s for %s", uuid[:8], self.sw.dev_label(device))
             return
-        log.warning("AuthorizeService %s REJECTED for %s", uuid[:8], self.sw.dev_label(device))
+        hint = ""
+        if self.sw.devices.get(device, {}).get("Paired"):
+            addr = self.sw.devices[device].get("Address", "<MAC>")
+            hint = f" - paired but not trusted: run 'bt-audio pair' and pair again, or 'sudo bluetoothctl trust {addr}'"
+        log.warning("AuthorizeService %s REJECTED for %s%s", uuid[:8], self.sw.dev_label(device), hint)
         raise DBusError("org.bluez.Error.Rejected", "not allowed")
 
     @method()
@@ -449,7 +453,9 @@ class Switch:
                              "connected" if changed["Connected"] else "disconnected")
                     if not changed["Connected"]:
                         self.codec_checked.discard(msg.path)
-                if changed.get("Paired") and msg.path in self.pending_trust:
+                # "Just Works" pairing (e.g. TVs) completes without asking the agent, so also
+                # trust anything that pairs while the pairing window is open
+                if changed.get("Paired") and (msg.path in self.pending_trust or pairing_open()):
                     asyncio.create_task(self.trust(msg.path))
                 self.publish()
                 return
