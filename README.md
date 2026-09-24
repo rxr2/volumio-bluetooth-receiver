@@ -104,6 +104,10 @@ A Volumio update or factory reset may wipe `/etc` and `/usr/local`. If that happ
 - **Crackles.** Increase `APLAY_BUFFER_US` (e.g. `300000`). With weak signal, a single underrun right after connecting is normal.
 - **Latency.** The default ALSA buffer is 200 ms, plus about 15 ms for decoding, plus the sender's own buffering (roughly 50–150 ms). Expect about 0.3 s in total. That's fine for music. For video, use the TV's lip-sync setting if it has one for Bluetooth.
 
+## Related
+
+- [volumio-ytmusic-cookie-sync](https://github.com/rxr2/volumio-ytmusic-cookie-sync): Chrome extension that keeps the Volumio YouTube Music plugin signed in (VBR 256 kbps instead of 160).
+
 ## License
 
 MIT, see [LICENSE](LICENSE).
